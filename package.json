@@ -2,9 +2,9 @@
   "name": "whatsapp-bot-web",
   "version": "1.0.0",
   "description": "WhatsApp bot with web interface",
-  "main": "server.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.6.0",
