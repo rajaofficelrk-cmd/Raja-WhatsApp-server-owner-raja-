@@ -1,400 +1,1433 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    fetchLatestBaileysVersion, 
-    delay 
+const makeWASocket = require('@whiskeysockets/baileys').default;
+const {
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  Browsers,
+  makeCacheableSignalKeyStore
 } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const express = require('express');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
+const multer = require('multer');
 
-// ================================================================
-//                DEVELOPED BY RK RAJA XWD
-// ================================================================
+const PORT = process.env.PORT || 25029;
+const HOST = '0.0.0.0';
+const SESSIONS_BASE_DIR = 'sessions_data';
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
-
-app.use(express.static('public'));
-
-const APP_NAME = 'RAJ MISHRA';
-const APP_VERSION = '1.0.0';
-const START_TIME = Date.now();
-
-// ---------- Global state ----------
-let sock = null;
-let botActive = false;
-let pairingRequested = false;
-
-// Task registry
-const tasks = new Map();
-const MAX_TASK_LOGS = 100;
-
-// ---------- Helpers ----------
-function genTaskId() {
-    return `RAJ-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+if (!fs.existsSync(SESSIONS_BASE_DIR)) {
+  fs.mkdirSync(SESSIONS_BASE_DIR, { recursive: true });
 }
 
-function fmtUptime(ms) {
-    const s = Math.floor(ms / 1000);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+const MIN_DELAY_SECONDS = 3;
+const DEFAULT_DELAY_SECONDS = 10;
+const SEND_RETRY = 2;
+const RETRY_WAIT_MS = 2000;
+const WATCHDOG_INTERVAL_MS = 10000;
+
+const sessions = {};
+let serverStartTime = Date.now();
+
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = String(Math.floor(s / 3600)).padStart(2, '0');
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const sec = String(s % 60).padStart(2, '0');
+  return `${h}:${m}:${sec}`;
 }
 
-function serializeTask(t) {
-    return {
-        id: t.id,
-        targetJid: t.targetJid,
-        status: t.status,
-        startTime: t.startTime,
-        endTime: t.endTime,
-        uptimeMs: (t.endTime || Date.now()) - t.startTime,
-        sentCount: t.sentCount,
-        roundCount: t.roundCount,
-        totalMessages: t.messages.length,
-        currentIndex: t.currentIndex
+class WhatsAppSession {
+  constructor(name) {
+    this.name = name;
+    this.authDir = path.join(SESSIONS_BASE_DIR, name);
+    this.sock = null;
+    this.pairingCode = null;
+    this.isPaired = false;
+    this.currentPhone = null;
+    this.pairingRequested = false;
+    this.isConnecting = false;
+    this.lastError = null;
+    this.connectedAt = null;
+    this.groupsCache = {};
+
+    this.bulkState = {
+      running: false,
+      stopFlag: false,
+      sent: 0,
+      failed: 0,
+      tasks: 0,
+      total: 0,
+      remaining: 0,
+      cycle: 0,
+      msgIndex: 0,
+      targetIndex: 0,
+      totalTargets: 0,
+      currentMessage: '',
+      currentTarget: '',
+      targets: [],
+      messages: [],
+      delayMs: DEFAULT_DELAY_SECONDS * 1000,
+      logs: [],
+      logId: 0,
+      startedAt: null,
+      workerAlive: false,
+      lastBeat: 0,
     };
-}
+  }
 
-// ---------- Logging (terminal silent) ----------
-function emitLog(msg, type = 'info') {
-    io.emit('log', { message: msg, type, ts: Date.now() });
-}
+  pushLog(type, msg) {
+    this.bulkState.logs.push({ id: ++this.bulkState.logId, ts: Date.now(), type, msg });
+    if (this.bulkState.logs.length > 500) this.bulkState.logs.splice(0, this.bulkState.logs.length - 500);
+    const icons = { ok: '✅', err: '❌', warn: '⚠️', info: 'ℹ️' };
+    console.log(`[${this.name}] ${icons[type] || '•'} ${msg}`);
+  }
 
-function taskLog(task, msg, type = 'info') {
-    const entry = { message: msg, type, ts: Date.now() };
-    task.logs.push(entry);
-    if (task.logs.length > MAX_TASK_LOGS) task.logs.shift();
-    io.emit('taskLogBroadcast', { taskId: task.id, ...entry });
-}
+  isSocketReady() {
+    return !!(this.sock && this.isPaired);
+  }
 
-// ================================================================
-//                Session Backup (every 6 hours, keep last 3)
-// ================================================================
-function backupSession() {
-    const src = './session';
-    if (!fs.existsSync(src)) return;
-    const backupDir = './session_backups';
-    if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
+  getGroupsFromStore() {
+    const out = [];
+    try {
+      if (this.sock && this.sock.store && this.sock.store.groupMetadata) {
+        const map = this.sock.store.groupMetadata;
+        map.forEach((v) => {
+          out.push({
+            id: v.id,
+            name: v.subject || '',
+            size: v.participants ? v.participants.length : 0,
+          });
+        });
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  async safeSend(jid, text) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= SEND_RETRY; attempt++) {
+      try {
+        if (!this.isSocketReady()) throw new Error('socket not ready');
+        await Promise.race([
+          this.sock.sendMessage(jid, { text }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('Send timeout')), 15000))
+        ]);
+        return { ok: true };
+      } catch (e) {
+        lastErr = e;
+        if (attempt < SEND_RETRY) {
+          await new Promise((r) => setTimeout(r, RETRY_WAIT_MS));
+        }
+      }
+    }
+    return { ok: false, error: lastErr ? lastErr.message : 'unknown' };
+  }
+
+  async runWorker() {
+    if (this.bulkState.workerAlive) return;
+    this.bulkState.workerAlive = true;
+    this.pushLog('info', `Pro Worker started — Exact ${this.bulkState.delayMs / 1000}s precise interval locked`);
 
     try {
-        const dst = path.join(backupDir, `session_${Date.now()}`);
-        fs.cpSync(src, dst, { recursive: true });
-        emitLog(`[BACKUP] Session backed up`, 'info');
+      while (!this.bulkState.stopFlag) {
+        this.bulkState.lastBeat = Date.now();
 
-        const backups = fs.readdirSync(backupDir).sort();
-        while (backups.length > 3) {
-            const old = backups.shift();
-            fs.rmSync(path.join(backupDir, old), { recursive: true, force: true });
+        if (!this.isSocketReady()) {
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
         }
-    } catch (err) {
-        emitLog(`[BACKUP FAIL] ${err.message}`, 'error');
+
+        if (!this.bulkState.messages.length || !this.bulkState.targets.length) {
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+
+        for (let mi = 0; mi < this.bulkState.messages.length && !this.bulkState.stopFlag; mi++) {
+          const msg = this.bulkState.messages[mi];
+          this.bulkState.msgIndex = mi;
+          this.bulkState.currentMessage = msg;
+
+          for (let ti = 0; ti < this.bulkState.targets.length && !this.bulkState.stopFlag; ti++) {
+            const t = this.bulkState.targets[ti];
+            this.bulkState.targetIndex = ti;
+            this.bulkState.currentTarget = t.label;
+            this.bulkState.lastBeat = Date.now();
+
+            if (!this.isSocketReady()) {
+              this.pushLog('warn', 'Socket drop detected — waiting for auto-reconnection...');
+              while (!this.isSocketReady() && !this.bulkState.stopFlag) {
+                await new Promise((r) => setTimeout(r, 2000));
+              }
+            }
+
+            if (this.bulkState.stopFlag) break;
+
+            const startTime = Date.now();
+
+            try {
+              const res = await this.safeSend(t.jid, msg);
+              if (res.ok) {
+                this.bulkState.sent++;
+                this.pushLog('ok', `Cycle ${this.bulkState.cycle + 1} | Msg ${mi + 1}/${this.bulkState.messages.length} → ${t.label}`);
+              } else {
+                this.bulkState.failed++;
+                this.pushLog('err', `Msg ${mi + 1} → ${t.label}: ${res.error}`);
+              }
+            } catch (e) {
+              this.bulkState.failed++;
+              this.pushLog('err', `Send error → ${t.label}: ${e.message}`);
+            }
+
+            this.bulkState.remaining = this.bulkState.messages.length - (mi + 1);
+
+            if (!this.bulkState.stopFlag) {
+              const elapsed = Date.now() - startTime;
+              const remainingWait = Math.max(100, this.bulkState.delayMs - elapsed);
+              await new Promise((r) => setTimeout(r, remainingWait));
+            }
+          }
+          if (this.bulkState.stopFlag) break;
+        }
+
+        if (!this.bulkState.stopFlag) {
+          this.bulkState.cycle++;
+          this.bulkState.remaining = this.bulkState.messages.length;
+          this.bulkState.msgIndex = 0;
+          this.bulkState.targetIndex = 0;
+          this.pushLog('info', `Cycle ${this.bulkState.cycle} completed successfully — looping seamlessly.`);
+        }
+      }
+    } catch (loopErr) {
+      this.pushLog('err', 'Worker exception: ' + loopErr.message);
+    } finally {
+      this.bulkState.workerAlive = false;
+      this.bulkState.running = false;
+      this.bulkState.stopFlag = false;
+      this.bulkState.currentMessage = '';
+      this.bulkState.currentTarget = '';
+      this.pushLog('warn', `Task fully halted. Sent: ${this.bulkState.sent}, Failed: ${this.bulkState.failed}`);
     }
-}
+  }
 
-setInterval(backupSession, 6 * 60 * 60 * 1000);
-setTimeout(backupSession, 60 * 1000);
+  async connect(phone) {
+    if (!phone) throw new Error('Phone number required');
+    if (this.isConnecting) throw new Error('Connection already in progress');
+    if (this.isPaired) throw new Error('Already paired');
 
-// ================================================================
-//                WhatsApp Bot Logic
-// ================================================================
-async function startBot(phoneNumber, socketId, autoRetry = true) {
-    if (sock) {
-        io.to(socketId).emit('log', { message: 'Bot already connected.', type: 'warn', ts: Date.now() });
-        io.to(socketId).emit('botStatus', { connected: true });
-        return;
-    }
-    botActive = true;
+    this.isConnecting = true;
+    this.currentPhone = phone;
+    this.pairingCode = null;
+    this.lastError = null;
 
-    const sessionDir = './session';
-    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+    try {
+      const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+      const { version } = await fetchLatestBaileysVersion();
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
-
-    sock = makeWASocket({
+      // PRO FIX: Bulletproof Mac Desktop browser profile with robust signal key store to eliminate linking errors
+      this.sock = makeWASocket({
         version,
-        logger: pino({ level: 'silent' }),
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+        },
         printQRInTerminal: false,
-        auth: state,
-        browser: ["Ubuntu", "Chrome", "20.0.0"]
-    });
+        logger: pino({ level: 'silent' }),
+        browser: Browsers.macOS('Desktop'),
+        syncFullHistory: false,
+        markOnlineOnConnect: true,
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 15000,
+        retryRequestDelayMs: 2500,
+      });
 
-    pairingRequested = false;
+      this.sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', async (update) => {
+      this.sock.ev.on('groups.upsert', (groups) => {
+        groups.forEach((g) => {
+          this.groupsCache[g.id] = {
+            id: g.id,
+            name: g.subject || '',
+            size: g.participants ? g.participants.length : 0,
+          };
+        });
+      });
+
+      this.sock.ev.on('groups.update', (updates) => {
+        updates.forEach((u) => {
+          if (this.groupsCache[u.id]) {
+            if (u.subject) this.groupsCache[u.id].name = u.subject;
+          } else if (u.id) {
+            this.groupsCache[u.id] = { id: u.id, name: u.subject || '', size: 0 };
+          }
+        });
+      });
+
+      this.sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
 
-        if (connection === 'connecting' && !sock.authState.creds.registered && !pairingRequested) {
-            pairingRequested = true;
-            await delay(4000);
+        if (connection === 'connecting' && !this.sock.authState.creds.registered && !this.pairingRequested) {
+          this.pairingRequested = true;
+          try {
+            await new Promise((r) => setTimeout(r, 5000));
+            const formattedPhone = phone.replace(/[^0-9]/g, '');
+            this.pairingCode = await this.sock.requestPairingCode(formattedPhone);
+            this.pushLog('info', `Pairing code generated successfully for ${formattedPhone}: ${this.pairingCode}`);
+            this.lastError = null;
+          } catch (err) {
+            this.pushLog('err', 'Pairing code generation error: ' + err.message);
+            this.lastError = err.message;
+            this.pairingCode = null;
+            this.pairingRequested = false;
+            this.isConnecting = false;
+          }
+        }
+
+        if (connection === 'open') {
+          this.isPaired = true;
+          this.pairingCode = null;
+          this.pairingRequested = false;
+          this.isConnecting = false;
+          this.connectedAt = new Date().toISOString();
+          this.lastError = null;
+          this.pushLog('ok', `WhatsApp connected successfully (${phone})`);
+
+          setTimeout(() => {
             try {
-                let code = await sock.requestPairingCode(phoneNumber);
-                code = code?.match(/.{1,4}/g)?.join("-") || code;
-                emitLog(`[+] PAIRING CODE: ${code}`, 'success');
-                io.to(socketId).emit('pairingCode', code);
-            } catch (error) {
-                emitLog(`[-] Pairing Code Failed: ${error.message || error}`, 'error');
-                botActive = false;
-                sock = null;
-                io.emit('botStatus', { connected: false });
-            }
+              const groups = this.getGroupsFromStore();
+              groups.forEach((g) => { this.groupsCache[g.id] = g; });
+            } catch (e) {}
+          }, 3000);
+
+          if (this.bulkState.running && !this.bulkState.workerAlive) {
+            this.runWorker();
+          }
         }
 
         if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            if (statusCode !== 401 && autoRetry) {
-                emitLog('[-] Network lost. Reconnecting in 3s...', 'warn');
-                sock = null;
-                botActive = false;
-                io.emit('botStatus', { connected: false });
-                await delay(3000);
-                startBot(phoneNumber, socketId, true);
-            } else if (statusCode === 401) {
-                emitLog('[-] Session expired, delete "session" folder.', 'error');
-                sock = null;
-                botActive = false;
-                io.emit('botStatus', { connected: false });
-            }
-        } else if (connection === 'open') {
-            emitLog('[SUCCESS] WhatsApp Connected! 🎉', 'success');
-            io.emit('botStatus', { connected: true });
-        }
-    });
+          const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
+          const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+          this.pushLog('warn', `Connection closed (code ${statusCode})`);
 
-    sock.ev.on('creds.update', saveCreds);
+          this.isPaired = false;
+          this.isConnecting = false;
+
+          if (shouldReconnect && this.currentPhone) {
+            this.pairingRequested = false;
+            setTimeout(() => this.connect(this.currentPhone).catch(() => {}), 4000);
+          } else if (statusCode === DisconnectReason.loggedOut) {
+            this.pairingCode = null;
+            this.pairingRequested = false;
+            this.currentPhone = null;
+            this.bulkState.stopFlag = true;
+          }
+        }
+      });
+    } catch (err) {
+      this.isConnecting = false;
+      this.lastError = err.message;
+      throw err;
+    }
+  }
+
+  async logout() {
+    this.bulkState.stopFlag = true;
+    this.bulkState.running = false;
+    if (this.sock) { try { await this.sock.logout(); } catch (_) {} }
+    if (fs.existsSync(this.authDir)) fs.rmSync(this.authDir, { recursive: true, force: true });
+    this.isPaired = false;
+    this.pairingCode = null;
+    this.currentPhone = null;
+    this.pairingRequested = false;
+    this.isConnecting = false;
+    this.connectedAt = null;
+    this.lastError = null;
+    this.sock = null;
+    this.groupsCache = {};
+    this.pushLog('warn', 'Logged out, session auth cleared');
+  }
 }
 
-// ================================================================
-//                Message Loop (per task)
-// ================================================================
-async function runTaskLoop(task) {
-    task.status = 'running';
-    io.emit('taskUpdate', serializeTask(task));
+setInterval(() => {
+  Object.values(sessions).forEach((sess) => {
+    if (sess.bulkState.running && (!sess.bulkState.workerAlive || Date.now() - sess.bulkState.lastBeat > 20000)) {
+      sess.pushLog('warn', 'Watchdog triggered: reviving frozen worker...');
+      sess.bulkState.workerAlive = false;
+      sess.runWorker();
+    }
+  });
+}, WATCHDOG_INTERVAL_MS);
 
-    while (task.loopRunning) {
-        for (let i = 0; i < task.messages.length; i++) {
-            if (!task.loopRunning) break;
-            task.currentIndex = i + 1;
+function getOrCreateSession(name) {
+  const cleanName = (name || 'default').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!sessions[cleanName]) {
+    sessions[cleanName] = new WhatsAppSession(cleanName);
+  }
+  return sessions[cleanName];
+}
 
-            let waitGuard = 0;
-            while (!sock && task.loopRunning && waitGuard < 60) {
-                await delay(1000);
-                waitGuard++;
-            }
-            if (!task.loopRunning) break;
-            if (!sock) {
-                taskLog(task, 'Bot disconnected. Pausing task.', 'warn');
-                task.loopRunning = false;
-                break;
-            }
+if (fs.existsSync(SESSIONS_BASE_DIR)) {
+  fs.readdirSync(SESSIONS_BASE_DIR, { withFileTypes: true }).forEach((dirent) => {
+    if (dirent.isDirectory()) {
+      getOrCreateSession(dirent.name);
+    }
+  });
+}
+if (Object.keys(sessions).length === 0) {
+  getOrCreateSession('default');
+}
 
-            task.sentCount++;
-            const fullMessage = `${(task.prefix || '').trim()} ${task.messages[i]}`.trim();
+const DASHBOARD_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>RK RAJA XWD — Pro Multi-Session Cyber Center</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&display=swap');
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:'Rajdhani',sans-serif;background:#030305;color:#e2e8f0;min-height:100vh;overflow-x:hidden;position:relative}
+  .live-bg{position:fixed;inset:0;z-index:-3;pointer-events:none;background:#030305;overflow:hidden}
+  .live-bg::before{content:"";position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(circle at 50% 50%, rgba(255,0,60,0.14) 0%, rgba(13,2,33,0.85) 45%, transparent 70%);animation:rotateGlow 15s linear infinite}
+  @keyframes rotateGlow{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+  .cyber-grid{position:fixed;inset:0;z-index:-2;pointer-events:none;background-image:linear-gradient(rgba(255,0,60,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,0,60,0.05) 1px, transparent 1px);background-size:40px 40px;animation:gridMove 20s linear infinite}
+  @keyframes gridMove{0%{background-position:0 0}100%{background-position:40px 40px}}
+  .floating-orbs{position:fixed;inset:0;z-index:-1;pointer-events:none;overflow:hidden}
+  .orb{position:absolute;border-radius:50%;filter:blur(90px);opacity:0.4;animation:orbFloat 10s ease-in-out infinite alternate}
+  .orb:nth-child(1){top:10%;left:15%;width:320px;height:320px;background:#ff003c;animation-delay:0s}
+  .orb:nth-child(2){bottom:10%;right:15%;width:380px;height:380px;background:#7928ca;animation-delay:3s}
+  @keyframes orbFloat{0%{transform:translate(0,0) scale(1)}100%{transform:translate(40px,50px) scale(1.18)}}
+  .container{max-width:1180px;margin:0 auto;padding:28px 18px 60px;position:relative;z-index:1}
+  .brand{text-align:center;margin-bottom:26px}
+  .brand h1{font-size:clamp(26px,4.5vw,44px);font-weight:900;letter-spacing:4px;background:linear-gradient(180deg,#ffffff 0%,#e0e0f0 40%,#ff003c 120%);-webkit-background-clip:text;background-clip:text;color:transparent;text-shadow:0 0 35px rgba(255,0,60,0.6);font-family:'Orbitron',sans-serif}
+  .brand h1 .x{color:#ff003c;-webkit-text-fill-color:#ff003c;text-shadow:0 0 22px #ff003c}
+  .brand p{color:#a0a0b5;font-size:12px;letter-spacing:4px;margin-top:6px;text-transform:uppercase;font-weight:600}
+  .tabs{display:flex;gap:12px;margin-bottom:24px;flex-wrap:wrap;justify-content:center}
+  .tab{padding:12px 24px;border-radius:12px;font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase;cursor:pointer;border:1px solid rgba(255,0,60,0.4);background:rgba(255,0,60,0.06);color:#ff5277;transition:all 0.3s ease;font-family:'Orbitron',sans-serif;backdrop-filter:blur(10px)}
+  .tab.active{background:linear-gradient(135deg,#ff0a45,#b3002d);color:#fff;border-color:#ff003c;box-shadow:0 0 25px rgba(255,0,60,0.6), inset 0 1px 0 rgba(255,255,255,0.3)}
+  .tab:hover:not(.active){background:rgba(255,0,60,0.15);color:#fff;box-shadow:0 0 15px rgba(255,0,60,0.3)}
+  .panel{display:none}
+  .panel.active{display:block;animation:fadeIn 0.4s cubic-bezier(0.16,1,0.3,1)}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+  .layout{display:grid;grid-template-columns:400px 1fr;gap:20px}
+  @media(max-width:900px){.layout{grid-template-columns:1fr}}
+  .card{position:relative;background:linear-gradient(145deg, rgba(18,18,26,0.85), rgba(8,8,14,0.9));border:1px solid rgba(255,0,60,0.35);border-radius:20px;padding:24px;margin-bottom:20px;backdrop-filter:blur(20px);box-shadow:0 20px 50px rgba(0,0,0,0.75), 0 0 30px rgba(255,0,60,0.1)}
+  .card::after{content:"";position:absolute;inset:0;border-radius:20px;pointer-events:none;border:1px solid rgba(255,255,255,0.06)}
+  .card h2{font-size:14px;margin-bottom:18px;color:#fff;letter-spacing:2px;display:flex;align-items:center;gap:10px;text-transform:uppercase;font-family:'Orbitron',sans-serif}
+  .card h2 .dot{width:9px;height:9px;border-radius:50%;background:#ff003c;box-shadow:0 0 15px #ff003c, 0 0 5px #fff}
+  label{display:block;font-size:11px;color:#a0a0b5;margin-bottom:8px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700}
+  input,textarea,select{width:100%;background:rgba(3,3,6,0.9);border:1px solid rgba(255,0,60,0.35);border-radius:12px;padding:12px 16px;color:#f1f1f6;font-size:14px;font-family:inherit;outline:none;transition:all 0.3s ease}
+  input:focus,textarea:focus,select:focus{border-color:#ff003c;box-shadow:0 0 0 3px rgba(255,0,60,0.25), 0 0 25px rgba(255,0,60,0.35)}
+  input:disabled{color:#5c5c6d;cursor:not-allowed}
+  textarea{resize:vertical;min-height:96px}
+  .field{margin-bottom:16px}
+  button{background:linear-gradient(135deg,#ff0a45,#b3002d);color:#fff;border:none;border-radius:12px;padding:14px 24px;font-size:12px;font-weight:700;letter-spacing:2px;text-transform:uppercase;cursor:pointer;transition:all 0.3s ease;margin-top:6px;width:100%;box-shadow:0 8px 25px rgba(255,0,60,0.35), inset 0 1px 0 rgba(255,255,255,0.3);font-family:'Orbitron',sans-serif}
+  button:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 12px 35px rgba(255,0,60,0.6), 0 0 20px rgba(255,0,60,0.45)}
+  button:disabled{background:#1c1c24;color:#555566;cursor:not-allowed;box-shadow:none}
+  button.ghost{background:transparent;border:1px solid rgba(255,0,60,0.55);color:#ff5277;box-shadow:none}
+  button.ghost:hover:not(:disabled){background:rgba(255,0,60,0.15);color:#fff}
+  button.danger{background:linear-gradient(135deg,#ff0040,#800020);border:1px solid #ff003c;box-shadow:0 8px 25px rgba(255,0,60,0.45)}
+  .btnrow{display:flex;gap:12px}
+  .btnrow button{margin-top:0}
+  .status-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap}
+  .badge{display:inline-block;padding:8px 18px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;font-family:'Orbitron',sans-serif}
+  .b-idle{background:rgba(120,120,140,0.15);color:#a8a8b8;border:1px solid rgba(120,120,140,0.35)}
+  .b-wait{background:rgba(255,180,0,0.15);color:#ffc655;border:1px solid rgba(255,180,0,0.45);animation:pulse 1.6s infinite}
+  .b-paired{background:rgba(255,0,60,0.15);color:#ff5277;border:1px solid rgba(255,0,60,0.6);box-shadow:0 0 20px rgba(255,0,60,0.3)}
+  .b-run{background:rgba(56,239,125,0.15);color:#38ef7d;border:1px solid rgba(56,239,125,0.6);box-shadow:0 0 20px rgba(56,239,125,0.35);animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
+  .code-box{background:rgba(3,3,6,0.95);border:2px dashed #ff003c;border-radius:16px;padding:28px 20px;margin:20px 0;text-align:center;box-shadow:inset 0 0 35px rgba(255,0,60,0.15), 0 0 25px rgba(255,0,60,0.25)}
+  .code-label{font-size:11px;color:#a0a0b5;letter-spacing:3px;margin-bottom:12px;text-transform:uppercase;font-weight:700}
+  .code-value{font-size:36px;font-weight:900;letter-spacing:8px;color:#ff003c;font-family:'Orbitron',monospace;text-shadow:0 0 25px rgba(255,0,60,0.85)}
+  .code-value.loading{font-size:16px;letter-spacing:1px;color:#a0a0b5;font-style:italic;text-shadow:none}
+  .steps{background:rgba(3,3,6,0.65);border:1px solid rgba(255,0,60,0.25);border-radius:14px;padding:18px;font-size:13px;line-height:2;color:#d0d0e0}
+  .steps b{color:#fff}
+  .msg{margin-top:14px;padding:12px 16px;border-radius:12px;font-size:13px;display:none}
+  .msg.ok{background:rgba(255,0,60,0.12);color:#ff8ba6;border:1px solid rgba(255,0,60,0.4);display:block}
+  .msg.err{background:rgba(255,60,60,0.12);color:#ffa1a1;border:1px solid rgba(255,60,60,0.4);display:block}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:520px){.grid2{grid-template-columns:1fr}}
+  .stat{background:rgba(3,3,6,0.7);border:1px solid rgba(255,0,60,0.25);border-radius:16px;padding:16px;text-align:center}
+  .stat .k{font-size:10px;color:#a0a0b5;letter-spacing:2px;text-transform:uppercase;margin-bottom:6px;font-weight:700}
+  .stat .v{font-size:24px;font-weight:900;color:#fff;text-shadow:0 0 15px rgba(255,0,60,0.4);word-break:break-all;font-family:'Orbitron',sans-serif}
+  .stat .v.red{color:#ff003c}
+  .stat .v.green{color:#38ef7d;text-shadow:0 0 15px rgba(56,239,125,0.5)}
+  .stat .v.small{font-size:14px;font-weight:700}
+  .statgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:14px}
+  @media(max-width:520px){.statgrid{grid-template-columns:1fr 1fr}}
+  .log{background:#010103;border:1px solid rgba(255,0,60,0.35);border-radius:16px;padding:16px;height:350px;overflow-y:auto;font-family:'Courier New',monospace;font-size:12px;line-height:1.8;box-shadow:inset 0 0 40px rgba(255,0,60,0.08)}
+  .log::-webkit-scrollbar{width:8px}
+  .log::-webkit-scrollbar-track{background:#050508}
+  .log::-webkit-scrollbar-thumb{background:#ff003c;border-radius:8px}
+  .log .line{color:#a0a0b5;border-bottom:1px dashed rgba(255,255,255,0.04);padding:3px 0;word-break:break-all}
+  .log .t{color:#ff5277;margin-right:8px;font-weight:bold}
+  .log .ok{color:#38ef7d}
+  .log .err{color:#ff6b6b}
+  .log .info{color:#6bc6ff}
+  .log .warn{color:#ffc655}
+  .progress{height:10px;background:rgba(3,3,6,0.95);border-radius:99px;overflow:hidden;border:1px solid rgba(255,0,60,0.35);margin-top:14px}
+  .progress > div{height:100%;width:0%;background:linear-gradient(90deg,#ff003c,#ff5277,#ff003c);background-size:200% 100%;transition:width 0.4s ease;animation:shine 2s linear infinite}
+  @keyframes shine{0%{background-position:0 0}100%{background-position:200% 0}}
+  .groups-toolbar{display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+  .groups-toolbar button{width:auto;margin-top:0;padding:10px 16px;font-size:11px}
+  .groups-toolbar .count{font-size:12px;color:#a0a0b5;margin-left:auto;letter-spacing:1px;font-weight:700}
+  .groups-list{background:rgba(3,3,6,0.75);border:1px solid rgba(255,0,60,0.25);border-radius:16px;max-height:360px;overflow-y:auto;padding:8px}
+  .groups-list::-webkit-scrollbar{width:8px}
+  .groups-list::-webkit-scrollbar-track{background:#050508}
+  .groups-list::-webkit-scrollbar-thumb{background:#ff003c;border-radius:8px}
+  .group-item{display:flex;align-items:center;gap:14px;padding:12px 14px;border-radius:12px;cursor:pointer;transition:all 0.2s ease;border:1px solid transparent}
+  .group-item:hover{background:rgba(255,0,60,0.12);border-color:rgba(255,0,60,0.35)}
+  .group-item.selected{background:rgba(255,0,60,0.2);border-color:#ff003c;box-shadow:0 0 15px rgba(255,0,60,0.2)}
+  .group-item input[type=checkbox]{width:20px;height:20px;accent-color:#ff003c;cursor:pointer;flex-shrink:0}
+  .group-info{flex:1;min-width:0}
+  .group-name{color:#f1f1f6;font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .group-jid{color:#808095;font-size:11px;font-family:'Courier New',monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+  .group-meta{color:#ff5277;font-size:10px;letter-spacing:1px;text-transform:uppercase;flex-shrink:0;font-weight:700}
+  .hidden{display:none!important}
+  .hint{font-size:11px;color:#808095;margin-top:8px;letter-spacing:0.5px}
+  .empty{padding:35px 20px;text-align:center;color:#808095;font-size:13px}
+  .footer{text-align:center;color:#555568;font-size:11px;letter-spacing:3px;margin-top:35px;text-transform:uppercase;font-weight:700}
+  .queue-box{background:rgba(3,3,6,0.9);border:1px solid rgba(255,0,60,0.35);border-radius:14px;padding:14px;margin-top:10px;font-size:12px;color:#d0d0e0;max-height:145px;overflow-y:auto;font-family:'Courier New',monospace;line-height:1.7}
+  .queue-box .qi{color:#6bc6ff;margin-right:8px;font-weight:bold}
+</style>
+</head>
+<body>
 
-            try {
-                await sock.sendMessage(task.targetJid, { text: fullMessage });
-                taskLog(task,
-                    `[SUCCESS] #${task.sentCount} | R${task.roundCount} [${i + 1}/${task.messages.length}]: ${fullMessage}`,
-                    'success');
-            } catch (err) {
-                taskLog(task,
-                    `[ERROR] #${task.sentCount} | Failed: ${err.message || err}`,
-                    'error');
-            }
+<div class="live-bg"></div>
+<div class="cyber-grid"></div>
+<div class="floating-orbs"><div class="orb"></div><div class="orb"></div></div>
 
-            if (task.sentCount % 5 === 0) io.emit('taskUpdate', serializeTask(task));
-            await delay(task.delayMs);
+<div class="container">
+  <div class="brand">
+    <h1>RK <span class="x">X</span> RAJA</h1>
+    <p>Pro Multi-Session Cyber Center</p>
+  </div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard & Pairing</div>
+    <div class="tab" data-tab="sender" onclick="switchTab('sender')">Bulk Sender Hub</div>
+  </div>
+
+  <div class="panel active" id="panel-dashboard">
+    <div class="card">
+      <h2><span class="dot"></span>Select or Create Session</h2>
+      <div class="field">
+        <label>Active Session Name</label>
+        <div style="display:flex;gap:10px">
+          <select id="dashSessionSelect" onchange="onSessionChange()"></select>
+          <button class="ghost" style="width:auto;margin-top:0" onclick="createNewSessionPrompt()">+ New Session</button>
+        </div>
+      </div>
+      <div class="field" style="margin-top:12px">
+        <label>Session Security Password (Required for controlling session)</label>
+        <input id="sessionPassword" type="password" placeholder="Enter session password..." oninput="savePassword()"/>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="status-row">
+        <h2 style="margin:0"><span class="dot"></span>Connection Status</h2>
+        <span id="badge" class="badge b-idle">Idle</span>
+      </div>
+      <div class="grid2">
+        <div class="stat"><div class="k">Number</div><div class="v" id="infoPhone">—</div></div>
+        <div class="stat"><div class="k">Connected At</div><div class="v" id="infoTime">—</div></div>
+      </div>
+      <div id="errBox" class="msg err hidden"></div>
+    </div>
+
+    <div class="card" id="pairCard">
+      <h2><span class="dot"></span>Pair WhatsApp</h2>
+      <label>Phone Number (country code, no + or spaces)</label>
+      <input id="phoneInput" type="tel" placeholder="e.g. 919876543210"/>
+      <button id="pairBtn" onclick="startPair()">Get Pairing Code</button>
+
+      <div id="codeSection" class="hidden">
+        <div class="code-box">
+          <div class="code-label">Your Pairing Code</div>
+          <div id="codeValue" class="code-value loading">Generating...</div>
+        </div>
+        <div class="steps">
+          <b>Steps:</b><br/>
+          1. Open WhatsApp<br/>
+          2. Go to <b>Linked Devices</b><br/>
+          3. <b>Link a Device</b> → <b>Link with phone number</b><br/>
+          4. Enter the code above
+        </div>
+      </div>
+      <div id="pairMsg" class="msg"></div>
+    </div>
+
+    <div class="card" id="groupsCard">
+      <h2><span class="dot"></span>Your WhatsApp Groups</h2>
+      <div class="groups-toolbar">
+        <button class="ghost" id="refreshGroupsBtn" onclick="fetchGroups()">Refresh Groups</button>
+        <button class="ghost" onclick="selectAllGroups()">Select All</button>
+        <button class="ghost" onclick="clearGroupSelection()">Clear</button>
+        <span class="count" id="groupsCount">0 groups</span>
+      </div>
+      <div class="groups-list" id="groupsList">
+        <div class="empty">Pair WhatsApp first, then click "Refresh Groups"</div>
+      </div>
+
+      <div class="field" style="margin-top:18px">
+        <label>Message to send to selected groups</label>
+        <textarea id="groupMsgInput" placeholder="Enter instant message to broadcast..."></textarea>
+      </div>
+      <button id="groupSendBtn" onclick="sendToSelectedGroups()">Send to Selected Groups</button>
+      <div id="groupSendMsg" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot"></span>Danger Zone</h2>
+      <p class="hint">Logout requires correct session password.</p>
+      <button class="ghost" onclick="logout()">Logout / Delete Session</button>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-sender">
+    <div class="layout">
+      <div>
+        <div class="card">
+          <h2><span class="dot"></span>Select Session</h2>
+          <div class="field">
+            <label>Active Sender Session</label>
+            <select id="senderSessionSelect" onchange="syncSessionDropdowns(this.value)"></select>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2><span class="dot"></span>Message Queue & Targets</h2>
+
+          <div class="field">
+            <label>Upload Messages File (.txt) — each line = one message</label>
+            <input id="fileInput" type="file" accept=".txt"/>
+            <div class="hint" id="fileHint">No file chosen</div>
+            <div class="queue-box" id="queuePreview" style="display:none"></div>
+          </div>
+
+          <div class="field">
+            <label>Send to Groups (fetch & pick)</label>
+            <div class="groups-toolbar" style="margin-bottom:8px">
+              <button class="ghost" onclick="fetchGroupsForBulk()">Fetch Groups</button>
+              <button class="ghost" onclick="selectAllBulkGroups()">All</button>
+              <button class="ghost" onclick="clearBulkGroups()">Clear</button>
+              <span class="count" id="bulkGroupsCount">0 selected</span>
+            </div>
+            <div class="groups-list" id="bulkGroupsList" style="max-height:200px">
+              <div class="empty">Click "Fetch Groups" to load</div>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Hater Name (optional prefix for each message)</label>
+            <input id="haterInput" type="text" placeholder="e.g. 9man X YAMDHUT"/>
+          </div>
+          <div class="field">
+            <label>Delay (seconds) — minimum 3s</label>
+            <input id="delayInput" type="number" min="3" value="10"/>
+          </div>
+          <div class="field">
+            <label>Last Hater Name (optional suffix)</label>
+            <input id="lastHaterInput" type="text" placeholder="e.g. YAMDHUD "/>
+          </div>
+
+          <div class="btnrow">
+            <button id="startBtn" onclick="startServer()">Start 24/7 Loop</button>
+            <button id="stopBtn" class="danger" onclick="stopTask()" disabled>Emergency Stop</button>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h2><span class="dot"></span>Live Stats</h2>
+          <div class="statgrid">
+            <div class="stat"><div class="k">Status</div><div class="v" id="statStatus">Idle</div></div>
+            <div class="stat"><div class="k">Paired</div><div class="v" id="statPaired">—</div></div>
+            <div class="stat"><div class="k">Uptime</div><div class="v red" id="statUptime">00:00:00</div></div>
+          </div>
+          <div class="statgrid">
+            <div class="stat"><div class="k">Sent</div><div class="v green" id="statSent">0</div></div>
+            <div class="stat"><div class="k">Failed</div><div class="v red" id="statFailed">0</div></div>
+            <div class="stat"><div class="k">Cycle</div><div class="v" id="statCycle">0</div></div>
+          </div>
+          <div class="statgrid">
+            <div class="stat"><div class="k">Messages</div><div class="v" id="statTotal">0</div></div>
+            <div class="stat"><div class="k">Remaining</div><div class="v" id="statRemaining">0</div></div>
+            <div class="stat"><div class="k">Progress</div><div class="v" id="statProgress">0%</div></div>
+          </div>
+
+          <div class="grid2" style="margin-top:14px">
+            <div class="stat"><div class="k">Current Message</div><div class="v small" id="statCurMsg">—</div></div>
+            <div class="stat"><div class="k">Current Target</div><div class="v small" id="statCurTarget">—</div></div>
+          </div>
+
+          <div class="progress"><div id="progBar"></div></div>
+        </div>
+
+        <div class="card">
+          <h2><span class="dot"></span>Live Cyber Log</h2>
+          <div class="log" id="logBox">
+            <div class="line"><span class="t">[boot]</span> Pro multi-session system initialized. Ready...</div>
+          </div>
+          <div class="btnrow" style="margin-top:14px">
+            <button class="ghost" onclick="clearLog()">Clear Log</button>
+            <button class="danger" onclick="stopTask()">Stop Task</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">RK RAJA XWD 💀 © — Pro Cyber Edition</div>
+</div>
+
+<script>
+let currentSession = 'default';
+let sessionPasswords = JSON.parse(localStorage.getItem('sessionPasswords') || '{}');
+
+function getPassword(){
+  return sessionPasswords[currentSession] || document.getElementById('sessionPassword').value.trim();
+}
+
+function savePassword(){
+  const pwd = document.getElementById('sessionPassword').value.trim();
+  if(pwd){
+    sessionPasswords[currentSession] = pwd;
+    localStorage.setItem('sessionPasswords', JSON.stringify(sessionPasswords));
+  }
+}
+
+function switchTab(name){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+name));
+}
+function showMsg(el,type,text){el.textContent=text;el.style.display=type?'block':'none';el.className='msg'+(type?' '+type:'');}
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function clearLog(){document.getElementById('logBox').innerHTML='';}
+function log(type,msg){
+  const box=document.getElementById('logBox');
+  const t=new Date().toLocaleTimeString();
+  const el=document.createElement('div');
+  el.className='line '+type;
+  el.innerHTML='<span class="t">['+t+']</span>'+escapeHtml(msg);
+  box.appendChild(el);
+  box.scrollTop=box.scrollHeight;
+  while(box.children.length>500) box.removeChild(box.firstChild);
+}
+
+async function loadSessions(){
+  try{
+    const res = await fetch('/api/sessions');
+    const d = await res.json();
+    if(d.sessions){
+      const opts = d.sessions.map(s => '<option value="'+s+'" '+(s===currentSession?'selected':'')+'>'+s+'</option>').join('');
+      document.getElementById('dashSessionSelect').innerHTML = opts;
+      document.getElementById('senderSessionSelect').innerHTML = opts;
+      if(!d.sessions.includes(currentSession) && d.sessions.length){
+        currentSession = d.sessions[0];
+      }
+      document.getElementById('sessionPassword').value = sessionPasswords[currentSession] || '';
+    }
+  }catch(e){console.error(e);}
+}
+
+function onSessionChange(){
+  currentSession = document.getElementById('dashSessionSelect').value;
+  document.getElementById('senderSessionSelect').value = currentSession;
+  document.getElementById('sessionPassword').value = sessionPasswords[currentSession] || '';
+  allGroups = [];
+  dashSelected.clear();
+  bulkSelected.clear();
+  renderDashGroups();
+  renderBulkGroups();
+  clearLog();
+  pollStatus();
+}
+
+function syncSessionDropdowns(val){
+  currentSession = val;
+  document.getElementById('dashSessionSelect').value = currentSession;
+  document.getElementById('sessionPassword').value = sessionPasswords[currentSession] || '';
+  allGroups = [];
+  dashSelected.clear();
+  bulkSelected.clear();
+  renderDashGroups();
+  renderBulkGroups();
+  clearLog();
+  pollStatus();
+}
+
+async function createNewSessionPrompt(){
+  const name = prompt('Enter new session name (e.g. session2, bot2):');
+  if(!name) return;
+  const clean = name.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  if(!clean) return;
+
+  const pwd = prompt('Set a security password for session "'+clean+'" (Only you can control it with this password):');
+  if(!pwd) return alert('Password is required to secure your session!');
+
+  try {
+    const res = await fetch('/api/sessions/create', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ session: clean, password: pwd })
+    });
+    const d = await res.json();
+    if(!d.success) throw new Error(d.error || 'Failed to create session');
+    
+    sessionPasswords[clean] = pwd;
+    localStorage.setItem('sessionPasswords', JSON.stringify(sessionPasswords));
+
+    currentSession = clean;
+    await loadSessions();
+    document.getElementById('dashSessionSelect').value = currentSession;
+    document.getElementById('senderSessionSelect').value = currentSession;
+    document.getElementById('sessionPassword').value = pwd;
+    onSessionChange();
+    pollStatus();
+  } catch(e) {
+    alert(e.message);
+  }
+}
+
+async function startPair(){
+  const phone=document.getElementById('phoneInput').value.trim();
+  const pwd=getPassword();
+  const btn=document.getElementById('pairBtn');
+  const msgEl=document.getElementById('pairMsg');
+  const codeSection=document.getElementById('codeSection');
+  if(!phone||!/^\\d{10,15}$/.test(phone)){showMsg(msgEl,'err','Enter a valid number (digits only)');return;}
+  if(!pwd){alert('Enter session password first!');return;}
+
+  btn.disabled=true;btn.textContent='Starting...';showMsg(msgEl,'','');
+  try{
+    const res=await fetch('/api/pair',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({phone, session: currentSession, password: pwd})
+    });
+    const data=await res.json();
+    if(!data.success)throw new Error(data.error||'Failed');
+    codeSection.classList.remove('hidden');
+    document.getElementById('codeValue').textContent='Generating...';
+    document.getElementById('codeValue').classList.add('loading');
+    showMsg(msgEl,'ok','Pairing started — code appears shortly');
+  }catch(e){showMsg(msgEl,'err',e.message);}
+  finally{btn.disabled=false;btn.textContent='Get Pairing Code';}
+}
+
+async function logout(){
+  const pwd=getPassword();
+  if(!confirm('Logout session "'+currentSession+'"? Password required.'))return;
+  try{
+    const res = await fetch('/api/logout',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session: currentSession, password: pwd})
+    });
+    const d = await res.json();
+    if(!d.success) throw new Error(d.error || 'Unauthorized');
+    delete sessionPasswords[currentSession];
+    localStorage.setItem('sessionPasswords', JSON.stringify(sessionPasswords));
+    await loadSessions();
+    onSessionChange();
+  }catch(e){alert(e.message);}
+}
+
+let allGroups=[];
+let dashSelected=new Set();
+let bulkSelected=new Set();
+
+async function fetchGroups(){
+  const btn=document.getElementById('refreshGroupsBtn');
+  const listEl=document.getElementById('groupsList');
+  btn.disabled=true;btn.textContent='Fetching...';
+  listEl.innerHTML='<div class="empty">Loading groups...</div>';
+  try{
+    const res=await fetch('/api/groups?session='+encodeURIComponent(currentSession)+'&password='+encodeURIComponent(getPassword()));
+    const d=await res.json();
+    if(!d.success) throw new Error(d.error||'Failed to fetch');
+    allGroups = d.groups || [];
+    renderDashGroups();
+    renderBulkGroups();
+    log('info', 'Fetched '+allGroups.length+' groups');
+  }catch(e){
+    listEl.innerHTML='<div class="empty" style="color:#ff6b6b">'+escapeHtml(e.message)+'</div>';
+    log('err','Fetch groups: '+e.message);
+  }finally{
+    btn.disabled=false;btn.textContent='Refresh Groups';
+  }
+}
+function renderDashGroups(){
+  const listEl=document.getElementById('groupsList');
+  document.getElementById('groupsCount').textContent=allGroups.length+' groups';
+  if(!allGroups.length){
+    listEl.innerHTML='<div class="empty">No groups found for this session</div>';
+    return;
+  }
+  listEl.innerHTML = allGroups.map(g=>{
+    const sel = dashSelected.has(g.id) ? ' selected' : '';
+    const checked = dashSelected.has(g.id) ? ' checked' : '';
+    return '<label class="group-item'+sel+'" data-jid="'+escapeHtml(g.id)+'">'+
+      '<input type="checkbox"'+checked+' onchange="toggleDashGroup(\\''+escapeHtml(g.id)+'\\',this.checked)"/>'+
+      '<div class="group-info">'+
+        '<div class="group-name">'+escapeHtml(g.name||'(no name)')+'</div>'+
+        '<div class="group-jid">'+escapeHtml(g.id)+'</div>'+
+      '</div>'+
+      '<div class="group-meta">'+(g.size?g.size+' members':'')+'</div>'+
+    '</label>';
+  }).join('');
+}
+function toggleDashGroup(jid, checked){
+  if(checked) dashSelected.add(jid); else dashSelected.delete(jid);
+  document.querySelectorAll('#groupsList .group-item').forEach(el=>{
+    if(el.dataset.jid===jid) el.classList.toggle('selected',checked);
+  });
+}
+function selectAllGroups(){allGroups.forEach(g=>dashSelected.add(g.id));renderDashGroups();}
+function clearGroupSelection(){dashSelected.clear();renderDashGroups();}
+
+async function sendToSelectedGroups(){
+  const msg=document.getElementById('groupMsgInput').value.trim();
+  const box=document.getElementById('groupSendMsg');
+  const btn=document.getElementById('groupSendBtn');
+  if(!dashSelected.size){showMsg(box,'err','Select at least one group');return;}
+  if(!msg){showMsg(box,'err','Enter a message');return;}
+  btn.disabled=true;btn.textContent='Sending...';showMsg(box,'','');
+  try{
+    const res=await fetch('/api/send-groups',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session: currentSession, password: getPassword(), groupIds:[...dashSelected], message:msg})
+    });
+    const d=await res.json();
+    if(!d.success) throw new Error(d.error||'Failed');
+    showMsg(box,'ok','Sent to '+d.sent+'/'+d.total+' groups');
+    log('ok','Group send: '+d.sent+'/'+d.total+' success');
+  }catch(e){showMsg(box,'err',e.message);log('err','Group send: '+e.message);}
+  finally{btn.disabled=false;btn.textContent='Send to Selected Groups';}
+}
+async function fetchGroupsForBulk(){
+  if(allGroups.length){ renderBulkGroups(); return; }
+  await fetchGroups();
+}
+function renderBulkGroups(){
+  const listEl=document.getElementById('bulkGroupsList');
+  document.getElementById('bulkGroupsCount').textContent=bulkSelected.size+' selected';
+  if(!allGroups.length){
+    listEl.innerHTML='<div class="empty">No groups loaded. Click "Fetch Groups"</div>';
+    return;
+  }
+  listEl.innerHTML = allGroups.map(g=>{
+    const sel = bulkSelected.has(g.id) ? ' selected' : '';
+    const checked = bulkSelected.has(g.id) ? ' checked' : '';
+    return '<label class="group-item'+sel+'" data-jid="'+escapeHtml(g.id)+'">'+
+      '<input type="checkbox"'+checked+' onchange="toggleBulkGroup(\\''+escapeHtml(g.id)+'\\',this.checked)"/>'+
+      '<div class="group-info">'+
+        '<div class="group-name">'+escapeHtml(g.name||'(no name)')+'</div>'+
+        '<div class="group-jid">'+escapeHtml(g.id)+'</div>'+
+      '</div>'+
+      '<div class="group-meta">'+(g.size?g.size+' members':'')+'</div>'+
+    '</label>';
+  }).join('');
+}
+function toggleBulkGroup(jid,checked){
+  if(checked) bulkSelected.add(jid); else bulkSelected.delete(jid);
+  document.getElementById('bulkGroupsCount').textContent=bulkSelected.size+' selected';
+  document.querySelectorAll('#bulkGroupsList .group-item').forEach(el=>{
+    if(el.dataset.jid===jid) el.classList.toggle('selected',checked);
+  });
+}
+function selectAllBulkGroups(){allGroups.forEach(g=>bulkSelected.add(g.id));renderBulkGroups();}
+function clearBulkGroups(){bulkSelected.clear();renderBulkGroups();}
+
+document.getElementById('fileInput').addEventListener('change',async (e)=>{
+  const f=e.target.files[0];
+  document.getElementById('fileHint').textContent=f?f.name:'No file chosen';
+  const box=document.getElementById('queuePreview');
+  if(!f){box.style.display='none';return;}
+  try{
+    const text=await f.text();
+    const seen=new Set(); const msgs=[];
+    text.split(/\\r?\\n/).forEach(line=>{
+      const t=line.trim();
+      if(!t)return; if(seen.has(t))return; seen.add(t); msgs.push(t);
+    });
+    if(!msgs.length){box.style.display='none';return;}
+    box.style.display='block';
+    box.innerHTML='<div style="color:#a0a0b5;margin-bottom:6px">Queue ('+msgs.length+' messages)</div>'+
+      msgs.map((m,i)=>'<div><span class="qi">'+(i+1)+'.</span>'+escapeHtml(m.slice(0,80))+(m.length>80?'…':'')+'</div>').join('');
+  }catch(_){box.style.display='none';}
+});
+
+async function startServer(){
+  const file=document.getElementById('fileInput').files[0];
+  const hater=document.getElementById('haterInput').value.trim();
+  let delay=parseInt(document.getElementById('delayInput').value)||10;
+  if(delay<3) delay=3;
+  const lastHater=document.getElementById('lastHaterInput').value.trim();
+
+  if(!file){alert('Please upload a .txt file');return;}
+  if(bulkSelected.size===0){alert('Please select at least one group');return;}
+
+  const startBtn=document.getElementById('startBtn');
+  const stopBtn=document.getElementById('stopBtn');
+  startBtn.disabled=true;startBtn.textContent='Starting...';
+
+  const fd=new FormData();
+  fd.append('session', currentSession);
+  fd.append('password', getPassword());
+  fd.append('file',file);
+  fd.append('hater',hater);
+  fd.append('delay',String(delay));
+  fd.append('lastHater',lastHater);
+  fd.append('groupIds',JSON.stringify([...bulkSelected]));
+
+  log('info','Starting precise 24/7 loop for session: '+currentSession);
+  try{
+    const res=await fetch('/api/bulk/start',{method:'POST',body:fd});
+    const d=await res.json();
+    if(!d.success)throw new Error(d.error||'Failed');
+    log('ok','Task running with exact delay — '+d.total+' messages');
+    stopBtn.disabled=false;
+  }catch(e){
+    log('err','Start failed: '+e.message);
+    alert('Start failed: '+e.message);
+  }finally{
+    startBtn.disabled=false;startBtn.textContent='Start 24/7 Loop';
+  }
+}
+async function stopTask(){
+  try{
+    const res=await fetch('/api/bulk/stop',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({session: currentSession, password: getPassword()})
+    });
+    const d=await res.json();
+    if(d.success) log('warn','Emergency stop executed for session: '+currentSession);
+    else log('err',d.error||'Unauthorized! Only the session owner can stop this task.');
+  }catch(e){log('err',e.message);}
+}
+
+async function pollStatus(){
+  try{
+    const res=await fetch('/api/status?session='+encodeURIComponent(currentSession));
+    const d=await res.json();
+    const badge=document.getElementById('badge');
+    const infoPhone=document.getElementById('infoPhone');
+    const infoTime=document.getElementById('infoTime');
+    const errBox=document.getElementById('errBox');
+    const codeSection=document.getElementById('codeSection');
+    const codeValue=document.getElementById('codeValue');
+    const pairCard=document.getElementById('pairCard');
+    const phoneInput=document.getElementById('phoneInput');
+    const pairBtn=document.getElementById('pairBtn');
+
+    infoPhone.textContent=d.phone||'—';
+    infoTime.textContent=d.connectedAt?new Date(d.connectedAt).toLocaleString():'—';
+    
+    pairCard.classList.remove('hidden');
+
+    if(d.paired){
+      badge.textContent='Paired';badge.className='badge b-paired';
+      codeSection.classList.add('hidden');
+      phoneInput.disabled=true;pairBtn.disabled=true;
+    }else if(d.code){
+      badge.textContent='Waiting for pairing';badge.className='badge b-wait';
+      codeSection.classList.remove('hidden');
+      codeValue.textContent=d.code;codeValue.classList.remove('loading');
+      phoneInput.disabled=true;pairBtn.disabled=true;
+    }else if(d.connecting){
+      badge.textContent='Connecting';badge.className='badge b-wait';
+      codeSection.classList.add('hidden');
+      phoneInput.disabled=true;pairBtn.disabled=true;
+    }else{
+      badge.textContent='Idle';badge.className='badge b-idle';
+      codeSection.classList.add('hidden');
+      phoneInput.disabled=false;pairBtn.disabled=false;
+    }
+    if(d.error){errBox.textContent='⚠ '+d.error;errBox.classList.remove('hidden');}
+    else{errBox.classList.add('hidden');}
+  }catch(e){}
+}
+
+let lastLogId=0;
+async function pollStats(){
+  try{
+    const res=await fetch('/api/bulk/status?session='+encodeURIComponent(currentSession));
+    const d=await res.json();
+    const statusEl=document.getElementById('statStatus');
+    statusEl.textContent=d.running?'Running 24/7':'Idle';
+    statusEl.style.color=d.running?'#38ef7d':'#fff';
+
+    document.getElementById('statPaired').textContent=d.paired?'Yes':'No';
+    document.getElementById('statUptime').textContent=d.uptimeFormatted||'00:00:00';
+    document.getElementById('statSent').textContent=d.sent||0;
+    document.getElementById('statFailed').textContent=d.failed||0;
+    document.getElementById('statCycle').textContent=d.cycle||0;
+    document.getElementById('statTotal').textContent=d.total||0;
+    document.getElementById('statRemaining').textContent=d.remaining||0;
+
+    document.getElementById('statCurMsg').textContent=d.currentMessage?(d.currentMessage.slice(0,40)+(d.currentMessage.length>40?'…':'')):'—';
+    document.getElementById('statCurTarget').textContent=d.currentTarget?d.currentTarget.slice(0,30):'—';
+
+    const pct=(d.total&&d.total>0)?Math.round(((d.total-d.remaining)/d.total)*100):0;
+    document.getElementById('statProgress').textContent=pct+'%';
+    document.getElementById('progBar').style.width=pct+'%';
+
+    const startBtn=document.getElementById('startBtn');
+    const stopBtn=document.getElementById('stopBtn');
+    if(d.running){startBtn.disabled=false;stopBtn.disabled=false;}
+    else{startBtn.disabled=false;stopBtn.disabled=true;}
+
+    if(d.logs&&d.logs.length){
+      const box=document.getElementById('logBox');
+      d.logs.forEach(l=>{
+        if(l.id>lastLogId){
+          const el=document.createElement('div');
+          el.className='line '+(l.type||'info');
+          el.innerHTML='<span class="t">['+new Date(l.ts).toLocaleTimeString()+']</span>'+escapeHtml(l.msg);
+          box.appendChild(el);
         }
-        if (!task.loopRunning) break;
-        task.roundCount++;
-        taskLog(task, `[+] Round ${task.roundCount} finished. Restarting...`, 'info');
+      });
+      if(d.logs.length) lastLogId=d.logs[d.logs.length-1].id;
+      box.scrollTop=box.scrollHeight;
+      while(box.children.length>500) box.removeChild(box.firstChild);
+    }
+  }catch(e){}
+}
+
+loadSessions().then(()=>{
+  setInterval(pollStatus,2000);
+  setInterval(pollStats,1500);
+  pollStatus();
+  pollStats();
+});
+</script>
+</body>
+</html>`;
+
+const app = express();
+app.use(express.json());
+
+app.get('/', (req, res) => res.type('html').send(DASHBOARD_HTML));
+
+const upload = multer({ dest: 'uploads/' });
+
+const sessionPasswords = {};
+
+app.get('/api/sessions', (req, res) => {
+  const list = Object.keys(sessions);
+  if (!list.includes('default')) list.unshift('default');
+  res.json({ success: true, sessions: list });
+});
+
+app.post('/api/sessions/create', (req, res) => {
+  const { session, password } = req.body;
+  if(!session) return res.status(400).json({ success: false, error: 'Session name required' });
+  if(!password) return res.status(400).json({ success: false, error: 'Password required' });
+  
+  const clean = session.trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  sessionPasswords[clean] = password;
+  getOrCreateSession(clean);
+  res.json({ success: true });
+});
+
+function verifyAuth(session, pwd) {
+  const clean = (session || 'default').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+  if (!sessionPasswords[clean]) {
+    if (pwd) sessionPasswords[clean] = pwd;
+    return true;
+  }
+  return sessionPasswords[clean] === pwd;
+}
+
+app.post('/api/pair', async (req, res) => {
+  try {
+    const { phone, session, password } = req.body;
+    if (!verifyAuth(session, password)) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Incorrect session password!' });
     }
 
-    task.status = 'stopped';
-    task.endTime = Date.now();
-    io.emit('taskUpdate', serializeTask(task));
-    taskLog(task, `Task ${task.id} stopped. Total sent: ${task.sentCount}`, 'warn');
-}
+    const sess = getOrCreateSession(session);
 
-// ================================================================
-//                HEALTH ENDPOINT  (GET + HEAD, always 200)
-// ================================================================
-function buildHealthData() {
-    const mem = process.memoryUsage();
-    const active = [...tasks.values()].filter(t => t.status === 'running').length;
-    return {
-        app: APP_NAME,
-        version: APP_VERSION,
-        status: 'ok',
-        message: 'Bot is alive ✅',
-        uptimeSec: Math.floor(process.uptime()),
-        uptimeHuman: fmtUptime(Date.now() - START_TIME),
-        memoryMB: Math.round(mem.rss / 1024 / 1024),
-        heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
-        botConnected: !!(sock && sock.user),
-        activeTasks: active,
-        totalTasks: tasks.size,
-        serverTime: new Date().toISOString()
-    };
-}
+    if (!phone || !/^\d{10,15}$/.test(phone)) {
+      return res.status(400).json({ success: false, error: 'Invalid phone number' });
+    }
+    if (sess.isConnecting) {
+      return res.status(400).json({ success: false, error: 'Connection in progress' });
+    }
+    
+    if (fs.existsSync(sess.authDir)) {
+      try {
+        fs.rmSync(sess.authDir, { recursive: true, force: true });
+      } catch (e) {}
+    }
 
-// GET /health  → returns JSON
-app.get('/health', (req, res) => {
-    res.status(200).json(buildHealthData());
-});
-
-// HEAD /health → returns 200 with no body (for pingers that only need status)
-app.head('/health', (req, res) => {
-    res.status(200).end();
-});
-
-// GET /  → simple text (for root pings)
-app.get('/', (req, res) => {
-    res.status(200).send('RAJ MISHRA Bot is running ✅');
-});
-
-// HEAD /  → for root pings
-app.head('/', (req, res) => {
-    res.status(200).end();
-});
-
-// HEAD /index.html → for UI pings
-app.head('/index.html', (req, res) => {
-    res.status(200).end();
-});
-
-// Catch-all HEAD for any other path → 200 (so any pinger URL works)
-app.head('*', (req, res) => {
-    res.status(200).end();
-});
-
-// ================================================================
-//                Graceful shutdown + crash handlers
-// ================================================================
-process.on('SIGINT', async () => {
-    for (const t of tasks.values()) t.loopRunning = false;
-    backupSession();
-    if (sock) { try { sock.end(undefined); } catch (e) {} }
-    await delay(500);
-    process.exit(0);
-});
-process.on('SIGTERM', () => process.emit('SIGINT'));
-process.on('uncaughtException', (err) => {
-    emitLog(`[FATAL] ${err.message}`, 'error');
-});
-process.on('unhandledRejection', (reason) => {
-    emitLog(`[FATAL REJECTION] ${reason}`, 'error');
-});
-
-// ================================================================
-//                Socket.IO Events
-// ================================================================
-io.on('connection', (socket) => {
-    socket.emit('botStatus', { connected: !!(sock && sock.user) });
-    socket.emit('taskList', [...tasks.values()].map(serializeTask));
-
-    socket.on('connectBot', async (data) => {
-        const phoneNumber = (data.phoneNumber || '').replace(/[^0-9]/g, '');
-        if (!phoneNumber) {
-            socket.emit('log', { message: 'Phone number required.', type: 'error', ts: Date.now() });
-            return;
-        }
-        await startBot(phoneNumber, socket.id);
+    sess.connect(phone).catch((e) => {
+      sess.lastError = e.message;
     });
 
-    socket.on('getGroups', async () => {
-        if (!sock) {
-            socket.emit('log', { message: 'Pehle connect karo.', type: 'warn', ts: Date.now() });
-            return;
-        }
-        try {
-            const groups = await sock.groupFetchAllParticipating();
-            const list = Object.values(groups).map(g => ({ id: g.id, subject: g.subject }));
-            socket.emit('groupList', list);
-            socket.emit('log', { message: `Fetched ${list.length} groups.`, type: 'success', ts: Date.now() });
-        } catch (err) {
-            socket.emit('log', { message: `Group fetch error: ${err.message || err}`, type: 'error', ts: Date.now() });
-        }
-    });
+    res.json({ success: true, message: 'Pairing initiated' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
 
-    socket.on('startTask', async (data) => {
-        if (!sock) {
-            socket.emit('log', { message: 'Pehle bot connect karo.', type: 'error', ts: Date.now() });
-            return;
-        }
-        const { targetJid, messages, prefix, delay: delaySec } = data;
-        if (!targetJid || !messages?.length) {
-            socket.emit('log', { message: 'Target/messages missing.', type: 'error', ts: Date.now() });
-            return;
-        }
+app.get('/api/status', (req, res) => {
+  const sessName = req.query.session || 'default';
+  const sess = getOrCreateSession(sessName);
+  res.json({
+    paired: sess.isPaired,
+    connecting: sess.isConnecting,
+    code: sess.isPaired ? null : sess.pairingCode,
+    phone: sess.currentPhone,
+    connectedAt: sess.connectedAt,
+    error: sess.lastError,
+  });
+});
 
-        const taskId = genTaskId();
-        const delayMs = (parseInt(delaySec) || 5) * 1000;
+app.get('/api/groups', async (req, res) => {
+  try {
+    const sessName = req.query.session || 'default';
+    const pwd = req.query.password;
+    if (!verifyAuth(sessName, pwd)) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Incorrect session password!' });
+    }
 
-        const task = {
-            id: taskId, targetJid, messages: [...messages],
-            prefix: prefix || '', delayMs,
-            status: 'starting', startTime: Date.now(), endTime: null,
-            sentCount: 0, roundCount: 1, currentIndex: 0,
-            loopRunning: true, logs: []
-        };
+    const sess = getOrCreateSession(sessName);
 
-        tasks.set(taskId, task);
-        emitLog(`Task ${taskId} created → ${targetJid}`, 'success');
-        socket.emit('taskCreated', serializeTask(task));
-        io.emit('taskList', [...tasks.values()].map(serializeTask));
-        runTaskLoop(task);
-    });
+    if (!sess.isPaired || !sess.sock) {
+      return res.status(400).json({ success: false, error: 'WhatsApp not paired yet' });
+    }
 
-    socket.on('stopTask', (data) => {
-        const task = tasks.get(data?.taskId);
-        if (!task) {
-            socket.emit('log', { message: `Task not found.`, type: 'error', ts: Date.now() });
-            return;
-        }
-        task.loopRunning = false;
-        taskLog(task, 'Stop requested by user.', 'warn');
-        io.emit('taskUpdate', serializeTask(task));
-    });
+    const map = new Map();
+    Object.values(sess.groupsCache).forEach((g) => map.set(g.id, g));
 
-    socket.on('getTaskInfo', (data) => {
-        const task = tasks.get(data?.taskId);
-        if (!task) { socket.emit('taskInfo', { error: 'Not found', taskId: data?.taskId }); return; }
-        socket.emit('taskInfo', {
-            ...serializeTask(task),
-            uptimeHuman: fmtUptime((task.endTime || Date.now()) - task.startTime),
-            logs: task.logs
+    try {
+      sess.getGroupsFromStore().forEach((g) => {
+        if (!map.has(g.id)) map.set(g.id, g);
+      });
+    } catch (_) {}
+
+    if (map.size === 0 && typeof sess.sock.groupFetchAllParticipating === 'function') {
+      try {
+        const all = await sess.sock.groupFetchAllParticipating();
+        Object.values(all).forEach((g) => {
+          map.set(g.id, {
+            id: g.id,
+            name: g.subject || '',
+            size: g.participants ? g.participants.length : 0,
+          });
         });
-    });
+      } catch (e) {}
+    }
 
-    socket.on('getTasks', () => {
-        socket.emit('taskList', [...tasks.values()].map(serializeTask));
-    });
+    const groups = [...map.values()]
+      .filter((g) => g.id && g.id.endsWith('@g.us'))
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
-    socket.on('stopBot', () => {
-        for (const t of tasks.values()) t.loopRunning = false;
-        try { if (sock) sock.end(undefined); } catch (e) {}
-        sock = null;
-        botActive = false;
-        emitLog('Bot stopped by user.', 'warn');
-        io.emit('botStatus', { connected: false });
-    });
+    groups.forEach((g) => { sess.groupsCache[g.id] = g; });
 
-    socket.on('disconnect', () => {});
+    res.json({ success: true, groups });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
-// ================================================================
-//                Start Server
-// ================================================================
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    // silent start
+app.post('/api/send-groups', async (req, res) => {
+  try {
+    const { session, password, groupIds, message } = req.body;
+    if (!verifyAuth(session, password)) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Incorrect session password!' });
+    }
+
+    const sess = getOrCreateSession(session);
+
+    if (!sess.isPaired || !sess.sock) return res.status(400).json({ success: false, error: 'WhatsApp not paired yet' });
+    if (!Array.isArray(groupIds) || !groupIds.length) {
+      return res.status(400).json({ success: false, error: 'No groups selected' });
+    }
+    if (!message || !message.trim()) {
+      return res.status(400).json({ success: false, error: 'Message is required' });
+    }
+
+    let sent = 0, failed = 0;
+    const errors = [];
+    for (const jid of groupIds) {
+      try {
+        await sess.sock.sendMessage(jid, { text: message });
+        sent++;
+      } catch (e) {
+        failed++;
+        errors.push(jid + ': ' + e.message);
+      }
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    res.json({ success: true, sent, failed, total: groupIds.length, errors });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
+
+app.post('/api/logout', async (req, res) => {
+  try {
+    const { session, password } = req.body;
+    const sessName = session || 'default';
+    if (!verifyAuth(sessName, password)) {
+      return res.status(401).json({ success: false, error: 'Unauthorized: Incorrect session password!' });
+    }
+
+    const sess = sessions[sessName];
+    if (sess) {
+      await sess.logout();
+      delete sessions[sessName];
+      delete sessionPasswords[sessName];
+    }
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/bulk/start', upload.single('file'), async (req, res) => {
+  try {
+    const { session, password, hater, delay, lastHater, groupIds } = req.body;
+    if (!verifyAuth(session, password)) {
+      if (req.file) { try { fs.unlinkSync(req.file.path); } catch (_) {} }
+      return res.status(401).json({ success: false, error: 'Unauthorized: Incorrect session password! Only session owner can start tasks.' });
+    }
+
+    const sess = getOrCreateSession(session);
+
+    if (!sess.isPaired || !sess.sock) {
+      if (req.file) { try { fs.unlinkSync(req.file.path); } catch (_) {} }
+      return res.status(400).json({ success: false, error: 'WhatsApp not paired yet.' });
+    }
+    if (sess.bulkState.running) {
+      if (req.file) { try { fs.unlinkSync(req.file.path); } catch (_) {} }
+      return res.status(400).json({ success: false, error: 'A task is already running on this session.' });
+    }
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'Please upload a .txt file' });
+    }
+
+    let messages = [];
+    try {
+      const content = fs.readFileSync(req.file.path, 'utf8');
+      const seen = new Set();
+      content.split(/\r?\n/).forEach((line) => {
+        const t = line.trim();
+        if (t && !seen.has(t)) {
+          seen.add(t);
+          messages.push(t);
+        }
+      });
+    } finally {
+      try { fs.unlinkSync(req.file.path); } catch (_) {}
+    }
+
+    if (!messages.length) {
+      return res.status(400).json({ success: false, error: 'No valid messages found' });
+    }
+
+    const targets = [];
+    const seen = new Set();
+    let parsedGroups = [];
+    try { parsedGroups = JSON.parse(groupIds || '[]'); } catch (_) {}
+    parsedGroups.forEach((jid) => {
+      if (jid && !seen.has(jid)) { seen.add(jid); targets.push({ jid, label: jid }); }
+    });
+
+    if (!targets.length) {
+      return res.status(400).json({ success: false, error: 'No targets selected' });
+    }
+
+    let delaySec = parseInt(delay) || DEFAULT_DELAY_SECONDS;
+    if (delaySec < MIN_DELAY_SECONDS) delaySec = MIN_DELAY_SECONDS;
+    const waitMs = delaySec * 1000;
+
+    const prefix = hater && hater.trim() ? hater.trim() + '\n\n' : '';
+    const suffix = lastHater && lastHater.trim() ? '\n\n' + lastHater.trim() + ' ' : '';
+    const preparedMessages = messages.map((m) => prefix + m + suffix);
+
+    sess.bulkState.running = true;
+    sess.bulkState.stopFlag = false;
+    sess.bulkState.sent = 0;
+    sess.bulkState.failed = 0;
+    sess.bulkState.tasks += 1;
+    sess.bulkState.total = messages.length;
+    sess.bulkState.remaining = messages.length;
+    sess.bulkState.cycle = 0;
+    sess.bulkState.msgIndex = 0;
+    sess.bulkState.targetIndex = 0;
+    sess.bulkState.totalTargets = targets.length;
+    sess.bulkState.currentMessage = preparedMessages[0] || '';
+    sess.bulkState.currentTarget = targets[0] ? targets[0].label : '';
+    sess.bulkState.targets = targets;
+    sess.bulkState.messages = preparedMessages;
+    sess.bulkState.delayMs = waitMs;
+    sess.bulkState.startedAt = Date.now();
+    sess.bulkState.workerAlive = false;
+    sess.bulkState.lastBeat = Date.now();
+
+    sess.pushLog('info', `Pro Loop launched — ${messages.length} messages × ${targets.length} targets with exact ${delaySec}s gap`);
+
+    sess.runWorker();
+
+    res.json({ success: true, total: messages.length, totalTargets: targets.length });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/api/bulk/stop', (req, res) => {
+  const { session, password } = req.body;
+  if (!verifyAuth(session, password)) {
+    return res.status(401).json({ success: false, error: 'Unauthorized! Only the session owner with the correct password can stop this task.' });
+  }
+
+  const sess = getOrCreateSession(session);
+  if (!sess.bulkState.running) {
+    return res.status(400).json({ success: false, error: 'No task running on this session.' });
+  }
+  sess.bulkState.stopFlag = true;
+  sess.bulkState.running = false;
+  sess.pushLog('warn', 'Emergency stop signal received and authorized');
+  res.json({ success: true });
+});
+
+app.get('/api/bulk/status', (req, res) => {
+  const sessName = req.query.session || 'default';
+  const sess = getOrCreateSession(sessName);
+  res.json({
+    running: sess.bulkState.running,
+    workerAlive: sess.bulkState.workerAlive,
+    paired: sess.isPaired,
+    sent: sess.bulkState.sent,
+    failed: sess.bulkState.failed,
+    tasks: sess.bulkState.tasks,
+    total: sess.bulkState.total,
+    remaining: sess.bulkState.remaining,
+    cycle: sess.bulkState.cycle,
+    msgIndex: sess.bulkState.msgIndex,
+    targetIndex: sess.bulkState.targetIndex,
+    totalTargets: sess.bulkState.totalTargets,
+    currentMessage: sess.bulkState.currentMessage,
+    currentTarget: sess.bulkState.currentTarget,
+    uptimeFormatted: formatUptime(Date.now() - serverStartTime),
+    logs: sess.bulkState.logs.slice(-200),
+  });
+});
+
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.listen(PORT, HOST, () => {
+  console.log('\n🌐 Pro Cyberpunk Dashboard Active: http://' + HOST + ':' + PORT + '/\n');
+});
+
+process.exit = process.exit || (() => {});
+process.on('SIGTERM', () => process.exit(0));
+process.on('SIGINT', () => process.exit(0));
